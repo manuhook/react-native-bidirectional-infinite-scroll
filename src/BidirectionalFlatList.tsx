@@ -1,4 +1,4 @@
-import React, {MutableRefObject, useRef, useState, useMemo, useEffect} from 'react';
+import React, { MutableRefObject, useRef, useState, useMemo, useEffect } from 'react';
 import {
   ActivityIndicator,
   FlatList as FlatListType,
@@ -7,9 +7,9 @@ import {
   StyleSheet,
   View,
   LayoutChangeEvent,
-  FlatList,
 } from 'react-native';
-import {useCallback} from 'react';
+import { FlatList } from '@stream-io/flat-list-mvcp';
+import { useCallback } from 'react';
 
 const styles = StyleSheet.create({
   indicatorContainer: {
