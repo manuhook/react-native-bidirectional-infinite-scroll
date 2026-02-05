@@ -1,4 +1,4 @@
-import React, { MutableRefObject, useRef, useState } from 'react';
+import React, {MutableRefObject, useRef, useState, useMemo, useEffect} from 'react';
 import {
   ActivityIndicator,
   FlatList as FlatListType,
@@ -6,8 +6,10 @@ import {
   ScrollViewProps,
   StyleSheet,
   View,
+  LayoutChangeEvent,
+  FlatList,
 } from 'react-native';
-import { FlatList } from '@stream-io/flat-list-mvcp';
+import {useCallback} from 'react';
 
 const styles = StyleSheet.create({
   indicatorContainer: {
@@ -16,10 +18,7 @@ const styles = StyleSheet.create({
   },
 });
 
-export type Props<T> = Omit<
-  FlatListProps<T>,
-  'maintainVisibleContentPosition'
-> & {
+export type Props<T> = FlatListProps<T> & {
   /**
    * Called once when the scroll position gets close to end of list. This must return a promise.
    * You can `onEndReachedThreshold` as distance from end of list, when this function should be called.
@@ -32,15 +31,6 @@ export type Props<T> = Omit<
   onStartReached: () => Promise<void>;
   /** Color for inline loading indicator */
   activityIndicatorColor?: string;
-  /**
-   * Enable autoScrollToTop.
-   * In chat type applications, you want to auto scroll to bottom, when new message comes it.
-   */
-  enableAutoscrollToTop?: boolean;
-  /**
-   * If `enableAutoscrollToTop` is true, the scroll threshold below which auto scrolling should occur.
-   */
-  autoscrollToTopThreshold?: number;
   /** Scroll distance from beginning of list, when onStartReached should be called. */
   onStartReachedThreshold?: number;
   /**
@@ -51,14 +41,11 @@ export type Props<T> = Omit<
   /** If true, inline loading indicators will be shown. Default - true */
   showDefaultLoadingIndicators?: boolean;
   /** Custom UI component for header inline loading indicator */
-  HeaderLoadingIndicator?: React.ComponentType;
+  HeaderLoadingIndicator?: React.ComponentType<any> | React.ReactElement | null;
   /** Custom UI component for footer inline loading indicator */
-  FooterLoadingIndicator?: React.ComponentType;
-  /** Custom UI component for header indicator of FlatList. Only used when `showDefaultLoadingIndicators` is false */
-  ListHeaderComponent?: React.ComponentType;
-  /** Custom UI component for footer indicator of FlatList. Only used when `showDefaultLoadingIndicators` is false */
-  ListFooterComponent?: React.ComponentType;
+  FooterLoadingIndicator?: React.ComponentType<any> | React.ReactElement | null;
 };
+
 /**
  * Note:
  * - `onEndReached` and `onStartReached` must return a promise.
@@ -79,38 +66,73 @@ export const BidirectionalFlatList = (React.forwardRef(
   ) => {
     const {
       activityIndicatorColor = 'black',
-      autoscrollToTopThreshold = 100,
-      data,
-      enableAutoscrollToTop,
+      progressViewOffset = 50,
+      data: initialData,
+      onLayout,
       FooterLoadingIndicator,
       HeaderLoadingIndicator,
       ListHeaderComponent,
       ListFooterComponent,
+      horizontal = false,
+      onContentSizeChange,
       onEndReached = () => Promise.resolve(),
       onEndReachedThreshold = 10,
       onScroll,
       onStartReached = () => Promise.resolve(),
       onStartReachedThreshold = 10,
       showDefaultLoadingIndicators = true,
+      maintainVisibleContentPosition: initialMaintainVisibleContentPosition,
     } = props;
+    const data = initialData ?? [];
+
+    // States
     const [onStartReachedInProgress, setOnStartReachedInProgress] = useState(
       false
     );
     const [onEndReachedInProgress, setOnEndReachedInProgress] = useState(false);
 
+    // Refs
+    const previousData = useRef<readonly T[]>();
+    const scrollMetrics = useRef<{
+      offset: number,
+      visibleLength: number,
+      contentLength: number,
+      direction: 'down' | 'up' | 'unknown',
+    }>({
+      offset: 0,
+      visibleLength: 0,
+      contentLength: 0,
+      direction: 'unknown',
+    });
     const onStartReachedTracker = useRef<Record<number, boolean>>({});
     const onEndReachedTracker = useRef<Record<number, boolean>>({});
 
     const onStartReachedInPromise = useRef<Promise<void> | null>(null);
     const onEndReachedInPromise = useRef<Promise<void> | null>(null);
 
-    const maybeCallOnStartReached = () => {
+    // Constants
+    const maintainVisibleContentPosition = useMemo(() => {
+      if (!initialMaintainVisibleContentPosition) {
+        return {
+          autoscrollToTopThreshold: undefined,
+          minIndexForVisible: 1,
+        };
+      }
+
+      return {
+        autoscrollToTopThreshold: initialMaintainVisibleContentPosition.autoscrollToTopThreshold,
+        minIndexForVisible: initialMaintainVisibleContentPosition.minIndexForVisible ?? 1,
+      };
+    }, [initialMaintainVisibleContentPosition]);
+
+    // Callbacks
+    const maybeCallOnStartReached = useCallback(() => {
       // If onStartReached has already been called for given data length, then ignore.
-      if (data?.length && onStartReachedTracker.current[data.length]) {
+      if (onStartReachedTracker.current[data.length]) {
         return;
       }
 
-      if (data?.length) {
+      if (data.length) {
         onStartReachedTracker.current[data.length] = true;
       }
 
@@ -130,15 +152,15 @@ export const BidirectionalFlatList = (React.forwardRef(
       } else {
         onStartReachedInPromise.current = onStartReached().then(p);
       }
-    };
+    }, [data.length]);
 
-    const maybeCallOnEndReached = () => {
+    const maybeCallOnEndReached = useCallback(() => {
       // If onEndReached has already been called for given data length, then ignore.
-      if (data?.length && onEndReachedTracker.current[data.length]) {
+      if (onEndReachedTracker.current[data.length]) {
         return;
       }
 
-      if (data?.length) {
+      if (data.length) {
         onEndReachedTracker.current[data.length] = true;
       }
 
@@ -158,90 +180,173 @@ export const BidirectionalFlatList = (React.forwardRef(
       } else {
         onEndReachedInPromise.current = onEndReached().then(p);
       }
-    };
+    }, [data.length]);
 
-    const handleScroll: ScrollViewProps['onScroll'] = (event) => {
-      // Call the parent onScroll handler, if provided.
+    const handleLayout = useCallback((event: LayoutChangeEvent) => {
+      onLayout?.(event);
+
+      scrollMetrics.current.visibleLength =
+        !horizontal
+          ? event.nativeEvent.layout.height
+          : event.nativeEvent.layout.width;
+    }, [onLayout, horizontal]);
+
+    const maybeCallOnEndStartReached = useCallback(() => {
+      const {offset, visibleLength, contentLength, direction} = scrollMetrics.current;
+
+      const startThreshold = onStartReachedThreshold != null ? onStartReachedThreshold * contentLength : 2;
+      const endThreshold = onEndReachedThreshold != null ? onEndReachedThreshold * contentLength : 2;
+      const distanceFromEnd = contentLength - visibleLength - offset;
+
+      const isScrollAtStart = offset <= startThreshold;
+      const isScrollAtEnd = distanceFromEnd < endThreshold;
+
+      if (isScrollAtStart && direction === 'up') {
+        maybeCallOnStartReached();
+      }
+
+      if (isScrollAtEnd && direction === 'down') {
+        maybeCallOnEndReached();
+      }
+    }, [
+      maybeCallOnStartReached,
+      maybeCallOnEndReached,
+      onStartReachedThreshold,
+      onEndReachedThreshold,
+    ]);
+
+    const handleContentSizeChange = useCallback((width: number, height: number) => {
+      onContentSizeChange?.(width, height);
+
+      if (scrollMetrics.current.visibleLength === 0) {
+        scrollMetrics.current.visibleLength = !horizontal ? height : width;
+
+        maybeCallOnEndStartReached();
+      }
+    }, [horizontal, onContentSizeChange, maybeCallOnEndStartReached]);
+
+    const handleScroll: ScrollViewProps['onScroll'] = useCallback((event) => {
+      const {offset: lastOffset} = scrollMetrics.current;
+
       onScroll?.(event);
 
       const offset = event.nativeEvent.contentOffset.y;
       const visibleLength = event.nativeEvent.layoutMeasurement.height;
       const contentLength = event.nativeEvent.contentSize.height;
+      const direction = offset > lastOffset ? 'down' : 'up';
 
-      // Check if scroll has reached either start of end of list.
-      const isScrollAtStart = offset < onStartReachedThreshold;
-      const isScrollAtEnd =
-        contentLength - visibleLength - offset < onEndReachedThreshold;
+      scrollMetrics.current = {
+        offset,
+        contentLength,
+        visibleLength,
+        direction,
+      };
 
-      if (isScrollAtStart) {
-        maybeCallOnStartReached();
-      }
+      maybeCallOnEndStartReached();
+    }, [
+      maybeCallOnEndStartReached,
+    ]);
 
-      if (isScrollAtEnd) {
-        maybeCallOnEndReached();
-      }
-    };
+    const renderHeaderLoadingIndicator = useCallback(() => {
+      const headerElement = ListHeaderComponent ? (
+        React.isValidElement(ListHeaderComponent) ? (
+          ListHeaderComponent
+        ) : (
+          // @ts-ignore 
+          <ListHeaderComponent />
+        )
+      ) : null;
+      const loadingElement = HeaderLoadingIndicator ? (
+        React.isValidElement(HeaderLoadingIndicator) ? (
+          HeaderLoadingIndicator
+        ) : (
+          // @ts-ignore 
+          <HeaderLoadingIndicator />
+        )
+      ) : null;
 
-    const renderHeaderLoadingIndicator = () => {
       if (!showDefaultLoadingIndicators) {
-        if (ListHeaderComponent) {
-          return <ListHeaderComponent />;
-        } else {
-          return null;
-        }
+        return headerElement;
       }
 
-      if (!onStartReachedInProgress) return null;
-
-      if (HeaderLoadingIndicator) {
-        return <HeaderLoadingIndicator />;
+      if (!onStartReachedInProgress) {
+        return headerElement;
       }
 
       return (
-        <View style={styles.indicatorContainer}>
-          <ActivityIndicator size={'small'} color={activityIndicatorColor} />
-        </View>
+        <>
+          {headerElement}
+          {/** @ts-ignore */}
+          <View style={styles.indicatorContainer}>
+            {!loadingElement ? <ActivityIndicator size={'small'} color={activityIndicatorColor} /> : loadingElement}
+          </View>
+        </>
       );
-    };
+    }, [showDefaultLoadingIndicators, onStartReachedInProgress]);
 
-    const renderFooterLoadingIndicator = () => {
+    const renderFooterLoadingIndicator = useCallback(() => {
+      const headerElement = ListFooterComponent ? (
+        React.isValidElement(ListFooterComponent) ? (
+          ListFooterComponent
+        ) : (
+          // @ts-ignore 
+          <ListFooterComponent />
+        )
+      ) : null;
+      const loadingElement = FooterLoadingIndicator ? (
+        React.isValidElement(FooterLoadingIndicator) ? (
+          FooterLoadingIndicator
+        ) : (
+          // @ts-ignore 
+          <FooterLoadingIndicator />
+        )
+      ) : null;
+
       if (!showDefaultLoadingIndicators) {
-        if (ListFooterComponent) {
-          return <ListFooterComponent />;
-        } else {
-          return null;
-        }
+        return headerElement;
       }
 
-      if (!onEndReachedInProgress) return null;
-
-      if (FooterLoadingIndicator) {
-        return <FooterLoadingIndicator />;
+      if (!onEndReachedInProgress) {
+        return headerElement;
       }
 
       return (
-        <View style={styles.indicatorContainer}>
-          <ActivityIndicator size={'small'} color={activityIndicatorColor} />
-        </View>
+        <>
+          {headerElement}
+          {/** @ts-ignore */}
+          <View style={styles.indicatorContainer}>
+            {!loadingElement ? <ActivityIndicator size={'small'} color={activityIndicatorColor} /> : loadingElement}
+          </View>
+        </>
       );
-    };
+    }, [showDefaultLoadingIndicators, onEndReachedInProgress]);
+
+    // Keep track of previous data
+    useEffect(() => {
+      // Reset trackers if new data size is smaller than old one
+      if (previousData.current && data.length < previousData.current.length) {
+        onStartReachedTracker.current = {};
+        onEndReachedTracker.current = {};
+      }
+    }, [data]);
+
+    useEffect(() => {
+      previousData.current = data;
+    });
 
     return (
       <>
         <FlatList<T>
           {...props}
           ref={ref}
-          progressViewOffset={50}
+          onLayout={handleLayout}
+          progressViewOffset={progressViewOffset}
           ListHeaderComponent={renderHeaderLoadingIndicator}
           ListFooterComponent={renderFooterLoadingIndicator}
           onEndReached={null}
           onScroll={handleScroll}
-          maintainVisibleContentPosition={{
-            autoscrollToTopThreshold: enableAutoscrollToTop
-              ? autoscrollToTopThreshold
-              : undefined,
-            minIndexForVisible: 1,
-          }}
+          maintainVisibleContentPosition={maintainVisibleContentPosition}
+          onContentSizeChange={handleContentSizeChange}
         />
       </>
     );
